@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env/
+env/
+*.egg-info/
+
+# Models
+models/weights/*.pt
+models/weights/*.pth
+
+# Data
+data/raw/
+data/processed/
+
+# Logs
+logs/*.log
+logs/unknowns/
+
+# Env
+.env
+
+# IDE
+.vscode/
+.idea/
