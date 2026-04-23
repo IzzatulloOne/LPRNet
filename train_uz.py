@@ -7,30 +7,34 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 
-# Путь к репозиторию
+# ===== ПУТИ =====
 sys.path.insert(0, r'C:\Users\user\Pictures\anpr_system\LPRNet_Pytorch')
 from model.LPRNet import build_lprnet
+
+TRAIN_DIR  = r'C:\Users\user\Pictures\anpr_system\dataset\final\train'
+VAL_DIR    = r'C:\Users\user\Pictures\anpr_system\dataset\final\val'
+PRETRAINED = r'C:\Users\user\Pictures\anpr_system\LPRNet_Pytorch\weights\Final_LPRNet_model.pth'
+SAVE_PATH  = r'C:\Users\user\Pictures\anpr_system\LPRNet_Pytorch\model\lprnet_uz_best.pth'
 
 # ===== КОНФИГ =====
 CHARS = ['0','1','2','3','4','5','6','7','8','9',
          'A','B','C','D','E','F','G','H','J','K',
          'L','M','N','O','P','Q','R','S','T','U',
-         'V','W','X','Y','Z',
-         '-']  # blank для CTC — всегда последний!
+         'V','W','X','Y','Z']
 
-CHARS_DICT   = {c: i for i, c in enumerate(CHARS)}
-IMG_SIZE     = (94, 24)
-BATCH_SIZE   = 64
-EPOCHS       = 60
-LR           = 1e-4
-PRETRAINED   = r'C:\Users\user\Pictures\anpr_system\LPRNet_Pytorch\weights\Final_LPRNet_model.pth'
-TRAIN_DIR    = r'C:\Users\user\Pictures\anpr_system\dataset\final\train'
-VAL_DIR      = r'C:\Users\user\Pictures\anpr_system\dataset\final\val'
-SAVE_PATH    = r'C:\Users\user\Pictures\anpr_system\LPRNet_Pytorch\model\lprnet_uz_best.pth'
-DEVICE       = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+BLANK_IDX   = 0
+CHARS_DICT  = {c: i+1 for i, c in enumerate(CHARS)}  # +1
+NUM_CLASSES = len(CHARS) + 1
+
+IMG_SIZE   = (94, 24)
+BATCH_SIZE = 64
+EPOCHS     = 60
+LR         = 1e-4
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 print(f"Device   : {DEVICE}")
-print(f"Num chars: {len(CHARS)} (включая blank)")
+print(f"Classes  : {NUM_CLASSES} (blank=0)")
 
 # ===== DATASET =====
 class UZPlateDataset(Dataset):
@@ -42,20 +46,24 @@ class UZPlateDataset(Dataset):
                 self.samples.append((str(fpath), label))
             else:
                 bad = [c for c in label if c not in CHARS_DICT]
-                print(f"⚠️  Пропущен {fpath.name} — неизвестные символы: {bad}")
+                print(f"⚠️ skip {fpath.name} bad chars: {bad}")
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         fpath, label = self.samples[idx]
+
         with open(fpath, 'rb') as f:
             buf = np.frombuffer(f.read(), dtype=np.uint8)
+
         img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         img = cv2.resize(img, IMG_SIZE)
+
         img = img.astype(np.float32)
         img -= 127.5
         img *= 0.0078125
+
         img = torch.from_numpy(img).permute(2, 0, 1)
         return img, label
 
@@ -65,70 +73,61 @@ def collate_fn(batch):
 
 train_ds = UZPlateDataset(TRAIN_DIR)
 val_ds   = UZPlateDataset(VAL_DIR)
-train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  collate_fn=collate_fn, num_workers=0)
-val_dl   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn, num_workers=0)
+
+train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  collate_fn=collate_fn)
+val_dl   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
 
 print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
 
 # ===== МОДЕЛЬ =====
 model = build_lprnet(
-    lpr_max_len  = 8,
-    phase        = False,   # False = inference/finetune режим
-    class_num    = len(CHARS),
-    dropout_rate = 0.5
-)
-model = model.to(DEVICE)
+    lpr_max_len=8,
+    phase=False,
+    class_num=NUM_CLASSES,
+    dropout_rate=0.5
+).to(DEVICE)
 
+# ===== PRETRAIN LOAD =====
 state = torch.load(PRETRAINED, map_location=DEVICE)
-
-# Смотрим размер последнего слоя в весах
-for k, v in state.items():
-    if 'container' in k or 'classifier' in k or 'fc' in k:
-        print(f"  {k}: {v.shape}")
-
-
 model_state = model.state_dict()
-filtered = {}
-skipped  = []
 
+filtered = {}
 for k, v in state.items():
     if k in model_state and v.shape == model_state[k].shape:
         filtered[k] = v
-    else:
-        skipped.append(f"{k}: {v.shape} → ожидается {model_state.get(k, '???')}")
 
 model_state.update(filtered)
 model.load_state_dict(model_state)
 
-print(f"✅ Загружено слоёв : {len(filtered)}")
-print(f"⚠️  Пропущено слоёв: {len(skipped)}")
-for s in skipped:
-    print(f"   {s}")
+print(f"Loaded layers: {len(filtered)}")
 
-# ===== ОПТИМИЗАТОР =====
-ctc_loss  = torch.nn.CTCLoss(blank=len(CHARS)-1, reduction='mean', zero_infinity=True)
+# ===== LOSS / OPT =====
+ctc_loss = torch.nn.CTCLoss(blank=BLANK_IDX, zero_infinity=True)
 optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=1e-5)
 scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)
 
-# ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
+# ===== ENCODE / DECODE =====
 def encode(labels):
     targets, lengths = [], []
     for label in labels:
         enc = [CHARS_DICT[c] for c in label]
         targets.extend(enc)
         lengths.append(len(enc))
-    return torch.tensor(targets, dtype=torch.long), torch.tensor(lengths, dtype=torch.long)
+    return torch.tensor(targets), torch.tensor(lengths)
 
 def decode(logits):
-    preds = logits.permute(1, 0, 2).argmax(-1).cpu().numpy()
+    preds = logits.argmax(dim=2).permute(1, 0).cpu().numpy()
     results = []
+
     for pred in preds:
-        chars, prev = [], -1
+        prev = -1
+        out = []
         for p in pred:
-            if p != prev and p != len(CHARS) - 1:
-                chars.append(CHARS[p])
+            if p != prev and p != BLANK_IDX:
+                out.append(CHARS[p-1])
             prev = p
-        results.append(''.join(chars))
+        results.append(''.join(out))
+
     return results
 
 def calc_accuracy(logits, labels):
@@ -136,49 +135,64 @@ def calc_accuracy(logits, labels):
     correct = sum(p == l for p, l in zip(decoded, labels))
     return correct, len(labels)
 
-# ===== TRAIN LOOP =====
+# ===== TRAIN =====
 best_acc = 0.0
 
-for epoch in range(1, EPOCHS + 1):
-    # --- Train ---
+for epoch in range(1, EPOCHS+1):
+
     model.train()
-    total_loss = 0.0
+    total_loss = 0
 
     for imgs, labels in train_dl:
-        imgs     = imgs.to(DEVICE)
-        logits   = model(imgs)
-        log_prob = torch.nn.functional.log_softmax(logits, dim=2)
-        targets, t_lens = encode(labels)
-        i_lens = torch.full((imgs.size(0),), logits.size(0), dtype=torch.long)
+        imgs = imgs.to(DEVICE)
 
-        loss = ctc_loss(log_prob, targets, i_lens, t_lens)
+        logits = model(imgs)          # [B, C, T]
+        logits = logits.permute(2,0,1)  # [T, B, C]
+
+        log_probs = torch.nn.functional.log_softmax(logits, dim=2)
+
+        targets, t_lens = encode(labels)
+        targets = targets.to(DEVICE)
+        t_lens  = t_lens.to(DEVICE)
+
+        i_lens = torch.full(
+            (imgs.size(0),),
+            logits.size(0),
+            dtype=torch.long
+        ).to(DEVICE)
+
+        loss = ctc_loss(log_probs, targets, i_lens, t_lens)
+
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         optimizer.step()
+
         total_loss += loss.item()
 
-    # --- Val ---
+    # ===== VAL =====
     model.eval()
     correct_total, total = 0, 0
+
     with torch.no_grad():
         for imgs, labels in val_dl:
             imgs = imgs.to(DEVICE)
             logits = model(imgs)
+
             c, t = calc_accuracy(logits, labels)
             correct_total += c
-            total         += t
+            total += t
 
-    val_acc  = correct_total / total
+    val_acc = correct_total / total
     avg_loss = total_loss / len(train_dl)
+
     scheduler.step()
 
-    print(f"Epoch {epoch:3d}/{EPOCHS} | loss={avg_loss:.4f} | val_acc={val_acc:.3f} ({correct_total}/{total})")
+    print(f"Epoch {epoch}/{EPOCHS} | loss={avg_loss:.4f} | acc={val_acc:.3f}")
 
     if val_acc > best_acc:
         best_acc = val_acc
         torch.save(model.state_dict(), SAVE_PATH)
-        print(f"  💾 Лучшая модель сохранена (acc={best_acc:.3f})")
+        print(f"💾 saved best: {best_acc:.3f}")
 
-print(f"\n🏁 Готово! Лучшая точность: {best_acc:.3f}")
-print(f"   Модель: {SAVE_PATH}")
+print(f"\nDone. Best acc: {best_acc:.3f}")
