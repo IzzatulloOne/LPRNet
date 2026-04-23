@@ -17,7 +17,7 @@ PRETRAINED = r"C:\Users\user\Pictures\anpr_system\LPRNet_Pytorch\weights\Final_L
 SAVE_PATH  = r"C:\Users\user\Pictures\anpr_system\LPRNet_Pytorch\model\lprnet_uz_best.pth"
 
 sys.path.insert(0, REPO_DIR)
-from model.LPRNet import build_lprnet
+from LPRNet_Pytorch.model.LPRNet import build_lprnet
 
 # =========================
 # КОНФИГ
@@ -307,5 +307,127 @@ for epoch in range(1, EPOCHS + 1):
         torch.save(model.state_dict(), SAVE_PATH)
         print(f"  Saved best model: acc={best_acc:.3f}")
 
+def main():
+    print(f"Device      : {DEVICE}")
+    print(f"CUDA avail  : {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"GPU         : {torch.cuda.get_device_name(0)}")
+
+    # ===== DATASET =====
+    train_ds = UZPlateDataset(TRAIN_DIR)
+    val_ds   = UZPlateDataset(VAL_DIR)
+
+    train_dl = DataLoader(
+        train_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=4,
+        pin_memory=(DEVICE.type == "cuda"),
+    )
+
+    val_dl = DataLoader(
+        val_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=2,
+        pin_memory=(DEVICE.type == "cuda"),
+    )
+
+    print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
+
+    # ===== MODEL =====
+    model = build_lprnet(
+        lpr_max_len=EXPECTED_LEN,
+        phase=False,
+        class_num=NUM_CLASSES,
+        dropout_rate=0.5
+    ).to(DEVICE)
+
+    print("Model device:", next(model.parameters()).device)
+
+    # ===== LOAD PRETRAINED =====
+    state = torch.load(PRETRAINED, map_location=DEVICE)
+    model_state = model.state_dict()
+
+    filtered = {}
+    for k, v in state.items():
+        if k in model_state and v.shape == model_state[k].shape:
+            filtered[k] = v
+
+    model_state.update(filtered)
+    model.load_state_dict(model_state)
+
+    print(f"Loaded layers: {len(filtered)}")
+
+    # ===== LOSS / OPT =====
+    ctc_loss = torch.nn.CTCLoss(blank=BLANK_IDX, zero_infinity=True)
+    optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)
+
+    # ===== TRAIN LOOP =====
+    best_acc = 0.0
+
+    for epoch in range(1, EPOCHS + 1):
+        model.train()
+        total_loss = 0.0
+
+        for imgs, labels in train_dl:
+            imgs = imgs.to(DEVICE, non_blocking=True)
+
+            logits = model(imgs)
+            logits = logits.permute(2, 0, 1)
+
+            log_probs = torch.nn.functional.log_softmax(logits, dim=2)
+
+            targets, t_lens = encode(labels)
+            i_lens = torch.full(
+                (imgs.size(0),),
+                logits.size(0),
+                dtype=torch.long,
+                device=DEVICE
+            )
+
+            loss = ctc_loss(log_probs, targets, i_lens, t_lens)
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        # ===== VAL =====
+        model.eval()
+        correct_total, total_total = 0, 0
+
+        with torch.no_grad():
+            for imgs, labels in val_dl:
+                imgs = imgs.to(DEVICE, non_blocking=True)
+                logits = model(imgs)
+
+                c, t, _ = exact_match_acc(logits, labels)
+                correct_total += c
+                total_total += t
+
+        avg_loss = total_loss / len(train_dl)
+        val_acc = correct_total / total_total
+
+        scheduler.step()
+
+        print(f"Epoch {epoch}/{EPOCHS} | loss={avg_loss:.4f} | acc={val_acc:.3f}")
+
+        if val_acc > best_acc:
+            best_acc = val_acc
+            torch.save(model.state_dict(), SAVE_PATH)
+            print(f"💾 saved best: {best_acc:.3f}")
+
+    print(f"\nDone. Best acc: {best_acc:.3f}")
+
 print(f"\nDone. Best acc: {best_acc:.3f}")
 print(f"Model saved to: {SAVE_PATH}")
+
+
+if __name__ == "__main__":
+    main()

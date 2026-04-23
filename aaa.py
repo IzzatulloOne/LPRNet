@@ -9,7 +9,7 @@ from pathlib import Path
 
 # Путь к репозиторию
 sys.path.insert(0, r'C:\Users\user\Pictures\anpr_system\LPRNet_Pytorch')
-from model.LPRNet import build_lprnet
+from LPRNet_Pytorch.model.LPRNet import build_lprnet
 
 # ===== КОНФИГ =====
 CHARS = ['0','1','2','3','4','5','6','7','8','9',
