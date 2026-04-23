@@ -86,7 +86,7 @@ for k, v in state.items():
     if 'container' in k or 'classifier' in k or 'fc' in k:
         print(f"  {k}: {v.shape}")
 
-# Фильтруем — пропускаем слои где размер не совпадает
+
 model_state = model.state_dict()
 filtered = {}
 skipped  = []
