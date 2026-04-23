@@ -79,10 +79,31 @@ model = build_lprnet(
 )
 model = model.to(DEVICE)
 
-# Загружаем претренированные веса — strict=False так как class_num другой
 state = torch.load(PRETRAINED, map_location=DEVICE)
-model.load_state_dict(state, strict=False)
-print(f"✅ Веса загружены: {PRETRAINED}")
+
+# Смотрим размер последнего слоя в весах
+for k, v in state.items():
+    if 'container' in k or 'classifier' in k or 'fc' in k:
+        print(f"  {k}: {v.shape}")
+
+# Фильтруем — пропускаем слои где размер не совпадает
+model_state = model.state_dict()
+filtered = {}
+skipped  = []
+
+for k, v in state.items():
+    if k in model_state and v.shape == model_state[k].shape:
+        filtered[k] = v
+    else:
+        skipped.append(f"{k}: {v.shape} → ожидается {model_state.get(k, '???')}")
+
+model_state.update(filtered)
+model.load_state_dict(model_state)
+
+print(f"✅ Загружено слоёв : {len(filtered)}")
+print(f"⚠️  Пропущено слоёв: {len(skipped)}")
+for s in skipped:
+    print(f"   {s}")
 
 # ===== ОПТИМИЗАТОР =====
 ctc_loss  = torch.nn.CTCLoss(blank=len(CHARS)-1, reduction='mean', zero_infinity=True)
