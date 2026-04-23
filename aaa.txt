@@ -1,18 +1,263 @@
-# 1. CHARS без blank
-CHARS = ['0','1','2','3','4','5','6','7','8','9',
-         'A','B','C','D','E','F','G','H','J','K',
-         'L','M','N','O','P','Q','R','S','T','U',
-         'V','W','X','Y','Z']
-CHARS_DICT = {c: i for i, c in enumerate(CHARS)}
-BLANK_IDX  = len(CHARS)   # 35
+На таком железе запускать обучение на CPU - это почти преступление против кремния. У тебя там NVIDIA GeForce RTX 4090 Laptop GPU и Intel Core i9-14900HX, а модель молотит на CPU. Это как купить суперкар и толкать его руками.
 
-# 2. build_lprnet
-model = build_lprnet(
-    lpr_max_len  = 8,
-    phase        = False,
-    class_num    = len(CHARS) + 1,
-    dropout_rate = 0.5
+Разберём нормально, как **включить обучение на CUDA** и **убедиться, что PyTorch реально использует GPU**, а не делает вид.
+
+---
+
+# 1. Проверка: видит ли PyTorch CUDA
+
+На мощном ноуте запусти:
+
+```python id="qg4k8d"
+import torch
+
+print("CUDA available:", torch.cuda.is_available())
+print("CUDA device count:", torch.cuda.device_count())
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name(0))
+```
+
+Если всё хорошо, увидишь что-то вроде:
+
+```python id="q4ms8k"
+CUDA available: True
+CUDA device count: 1
+GPU: NVIDIA GeForce RTX 4090 Laptop GPU
+```
+
+---
+
+# 2. Если пишет `False`
+
+Значит проблема в одном из трёх:
+
+---
+
+## **а) PyTorch установлен без CUDA**
+
+Очень часто ставят обычный CPU-only PyTorch.
+
+Проверь:
+
+```python id="sgw1wu"
+import torch
+print(torch.version.cuda)
+```
+
+Если:
+
+```python id="5m8t0u"
+None
+```
+
+значит у тебя **CPU-версия PyTorch**.
+
+---
+
+## Решение:
+
+Переустановить PyTorch с CUDA:
+
+Для CUDA 12.1:
+
+```bash
+pip uninstall torch torchvision torchaudio
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```
+
+---
+
+Потом проверить:
+
+```python id="f8i6gw"
+import torch
+print(torch.cuda.is_available())
+print(torch.version.cuda)
+```
+
+---
+
+## **б) Нет драйвера NVIDIA**
+
+Проверь в консоли:
+
+```bash
+nvidia-smi
+```
+
+Если всё ок, увидишь таблицу с GPU.
+
+Если команда не работает, ставь драйвер для NVIDIA GeForce RTX 4090 Laptop GPU.
+
+---
+
+## **в) Windows использует встроенную графику**
+
+На ноутбуках иногда Python идёт через Intel GPU.
+
+Нужно:
+
+### Windows:
+
+**Параметры → Дисплей → Графика**
+добавить `python.exe` и поставить:
+
+> **High Performance**
+
+Чтобы использовалась NVIDIA GeForce RTX 4090 Laptop GPU.
+
+---
+
+# 3. В твоём коде CUDA уже почти подключена
+
+У тебя есть:
+
+```python id="g0j1hb"
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+```
+
+Это правильно.
+
+И дальше:
+
+```python id="52ofdg"
+model.to(DEVICE)
+imgs = imgs.to(DEVICE)
+targets = targets.to(DEVICE)
+```
+
+Это тоже правильно.
+
+То есть если `torch.cuda.is_available() == True`, модель автоматически уйдёт на GPU.
+
+---
+
+# 4. Как проверить, что реально идёт обучение на GPU
+
+Добавь:
+
+```python id="17l7x0"
+print("Using device:", DEVICE)
+print("Model on:", next(model.parameters()).device)
+```
+
+Должно быть:
+
+```python id="wh6sqn"
+Using device: cuda
+Model on: cuda:0
+```
+
+---
+
+# 5. Проверка нагрузки на GPU во время обучения
+
+Во время обучения открой:
+
+```bash
+nvidia-smi
+```
+
+Если обучение реально идёт на GPU, увидишь:
+
+* использование памяти GPU
+* загрузку GPU %
+* процесс `python.exe`
+
+Например:
+
+```python id="g6ec33"
+python.exe    2500 MiB
+```
+
+Это значит модель сидит на видеокарте.
+
+---
+
+# 6. Можно добавить вывод памяти прямо в код
+
+```python id="c6n1jk"
+if torch.cuda.is_available():
+    print(torch.cuda.memory_allocated() / 1024**2, "MB")
+```
+
+---
+
+# 7. Чтобы GPU грузился сильнее
+
+Сейчас у тебя:
+
+```python id="0eg4fq"
+num_workers=0
+```
+
+Это тормозит подачу данных.
+
+Поставь:
+
+```python id="vq7hyn"
+train_dl = DataLoader(
+    train_ds,
+    batch_size=64,
+    shuffle=True,
+    collate_fn=collate_fn,
+    num_workers=4,
+    pin_memory=True
 )
+```
 
-# 3. CTCLoss
-ctc_loss = torch.nn.CTCLoss(blank=BLANK_IDX, reduction='mean', zero_infinity=True)
+И для val тоже.
+
+---
+
+## Почему это важно:
+
+GPU ждёт данные от CPU.
+
+Если `num_workers=0`, твой NVIDIA GeForce RTX 4090 Laptop GPU может простаивать.
+
+---
+
+# 8. Итоговая проверка
+
+Если хочешь убедиться окончательно:
+
+```python id="9mld4e"
+print("CUDA:", torch.cuda.is_available())
+print("Device:", next(model.parameters()).device)
+```
+
+И параллельно:
+
+```bash
+nvidia-smi
+```
+
+Если увидел:
+
+* `cuda:0`
+* процесс `python.exe`
+* занята память GPU
+
+значит обучение реально идёт на видеокарте.
+
+---
+
+# 9. Самое главное
+
+Если сейчас у тебя вывод:
+
+```python id="2yewj4"
+Device : cpu
+```
+
+то **CUDA сейчас не работает вообще**, и сначала нужно проверить:
+
+1. `torch.cuda.is_available()`
+2. `torch.version.cuda`
+3. `nvidia-smi`
+
+Потому что твой код уже умеет работать на GPU, просто среда пока нет.
+
+И да, на твоём NVIDIA GeForce RTX 4090 Laptop GPU LPRNet будет летать в разы быстрее, чем на CPU.
+На CPU это минуты на эпоху, на GPU - секунды. Люди покупают такие видеокарты не чтобы греть комнату.
