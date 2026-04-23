@@ -1,263 +1,659 @@
-На таком железе запускать обучение на CPU - это почти преступление против кремния. У тебя там NVIDIA GeForce RTX 4090 Laptop GPU и Intel Core i9-14900HX, а модель молотит на CPU. Это как купить суперкар и толкать его руками.
+import math
+import random
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
 
-Разберём нормально, как **включить обучение на CUDA** и **убедиться, что PyTorch реально использует GPU**, а не делает вид.
-
----
-
-# 1. Проверка: видит ли PyTorch CUDA
-
-На мощном ноуте запусти:
-
-```python id="qg4k8d"
+import cv2
+import numpy as np
 import torch
-
-print("CUDA available:", torch.cuda.is_available())
-print("CUDA device count:", torch.cuda.device_count())
-if torch.cuda.is_available():
-    print("GPU:", torch.cuda.get_device_name(0))
-```
-
-Если всё хорошо, увидишь что-то вроде:
-
-```python id="q4ms8k"
-CUDA available: True
-CUDA device count: 1
-GPU: NVIDIA GeForce RTX 4090 Laptop GPU
-```
-
----
-
-# 2. Если пишет `False`
-
-Значит проблема в одном из трёх:
-
----
-
-## **а) PyTorch установлен без CUDA**
-
-Очень часто ставят обычный CPU-only PyTorch.
-
-Проверь:
-
-```python id="sgw1wu"
-import torch
-print(torch.version.cuda)
-```
-
-Если:
-
-```python id="5m8t0u"
-None
-```
-
-значит у тебя **CPU-версия PyTorch**.
-
----
-
-## Решение:
-
-Переустановить PyTorch с CUDA:
-
-Для CUDA 12.1:
-
-```bash
-pip uninstall torch torchvision torchaudio
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-```
-
----
-
-Потом проверить:
-
-```python id="f8i6gw"
-import torch
-print(torch.cuda.is_available())
-print(torch.version.cuda)
-```
-
----
-
-## **б) Нет драйвера NVIDIA**
-
-Проверь в консоли:
-
-```bash
-nvidia-smi
-```
-
-Если всё ок, увидишь таблицу с GPU.
-
-Если команда не работает, ставь драйвер для NVIDIA GeForce RTX 4090 Laptop GPU.
-
----
-
-## **в) Windows использует встроенную графику**
-
-На ноутбуках иногда Python идёт через Intel GPU.
-
-Нужно:
-
-### Windows:
-
-**Параметры → Дисплей → Графика**
-добавить `python.exe` и поставить:
-
-> **High Performance**
-
-Чтобы использовалась NVIDIA GeForce RTX 4090 Laptop GPU.
-
----
-
-# 3. В твоём коде CUDA уже почти подключена
-
-У тебя есть:
-
-```python id="g0j1hb"
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-```
-
-Это правильно.
-
-И дальше:
-
-```python id="52ofdg"
-model.to(DEVICE)
-imgs = imgs.to(DEVICE)
-targets = targets.to(DEVICE)
-```
-
-Это тоже правильно.
-
-То есть если `torch.cuda.is_available() == True`, модель автоматически уйдёт на GPU.
-
----
-
-# 4. Как проверить, что реально идёт обучение на GPU
-
-Добавь:
-
-```python id="17l7x0"
-print("Using device:", DEVICE)
-print("Model on:", next(model.parameters()).device)
-```
-
-Должно быть:
-
-```python id="wh6sqn"
-Using device: cuda
-Model on: cuda:0
-```
-
----
-
-# 5. Проверка нагрузки на GPU во время обучения
-
-Во время обучения открой:
-
-```bash
-nvidia-smi
-```
-
-Если обучение реально идёт на GPU, увидишь:
-
-* использование памяти GPU
-* загрузку GPU %
-* процесс `python.exe`
-
-Например:
-
-```python id="g6ec33"
-python.exe    2500 MiB
-```
-
-Это значит модель сидит на видеокарте.
-
----
-
-# 6. Можно добавить вывод памяти прямо в код
-
-```python id="c6n1jk"
-if torch.cuda.is_available():
-    print(torch.cuda.memory_allocated() / 1024**2, "MB")
-```
-
----
-
-# 7. Чтобы GPU грузился сильнее
-
-Сейчас у тебя:
-
-```python id="0eg4fq"
-num_workers=0
-```
-
-Это тормозит подачу данных.
-
-Поставь:
-
-```python id="vq7hyn"
-train_dl = DataLoader(
-    train_ds,
-    batch_size=64,
-    shuffle=True,
-    collate_fn=collate_fn,
-    num_workers=4,
-    pin_memory=True
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT_CANDIDATES = [
+    SCRIPT_DIR,
+    SCRIPT_DIR.parent,
+    SCRIPT_DIR.parent.parent,
+]
+
+
+def find_first_existing(*relative_candidates: str) -> Path:
+    for base in ROOT_CANDIDATES:
+        for rel in relative_candidates:
+            candidate = base / rel
+            if candidate.exists():
+                return candidate
+    raise FileNotFoundError(
+        "None of the candidate paths exists:\n"
+        + "\n".join(str(Path(base) / rel) for base in ROOT_CANDIDATES for rel in relative_candidates)
+    )
+
+
+LPRNET_REPO_DIR = find_first_existing(
+    "LPRNet_Pytorch",
+    "LPRnet/LPRNet_Pytorch",
+    "anpr_system/LPRNet_Pytorch",
+    "ANPR/LPRNet/LPRNet_Pytorch",
 )
-```
 
-И для val тоже.
+DATA_ROOT = find_first_existing(
+    "dataset/final",
+    "data/final",
+    "ANPR/LPRNet/dataset/final",
+    "anpr_system/data/final",
+)
 
----
+TRAIN_DIR = DATA_ROOT / "train"
+VAL_DIR = DATA_ROOT / "val"
 
-## Почему это важно:
+sys.path.insert(0, str(LPRNET_REPO_DIR))
+from model.LPRNet import build_lprnet
 
-GPU ждёт данные от CPU.
 
-Если `num_workers=0`, твой NVIDIA GeForce RTX 4090 Laptop GPU может простаивать.
+EXPECTED_LEN = 8
+DEFAULT_CHARS = list("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+IMG_SIZE = (94, 24)
 
----
+AUTO_CHARS_FROM_DATA = True
+USE_PRETRAINED = False
+FREEZE_BACKBONE_EPOCHS = 0
+USE_BALANCED_SAMPLER = True
+USE_AUGMENT = True
 
-# 8. Итоговая проверка
+BATCH_SIZE = 48
+EPOCHS = 120
+LR = 3e-4
+BACKBONE_LR = 1e-4
+WEIGHT_DECAY = 1e-5
+DROPOUT_RATE = 0.35
 
-Если хочешь убедиться окончательно:
+MIN_EPOCHS = 25
+EARLY_STOP_PATIENCE = 30
+LR_PATIENCE = 8
+LR_FACTOR = 0.5
+MIN_LR = 1e-6
 
-```python id="9mld4e"
-print("CUDA:", torch.cuda.is_available())
-print("Device:", next(model.parameters()).device)
-```
+PRETRAINED_PATH = find_first_existing(
+    "LPRNet_Pytorch/weights/Final_LPRNet_model.pth",
+    "weights/Final_LPRNet_model.pth",
+    "LPRnet/LPRNet_Pytorch/weights/Final_LPRNet_model.pth",
+    "ANPR/LPRNet/LPRNet_Pytorch/weights/Final_LPRNet_model.pth",
+)
 
-И параллельно:
+SAVE_DIR = find_first_existing(
+    "models",
+    "LPRNet_Pytorch/model",
+    "ANPR/models",
+    "anpr_system/models",
+)
+SAVE_DIR.mkdir(parents=True, exist_ok=True)
+SAVE_PATH = SAVE_DIR / "lprnet_uz_boost_best.pth"
 
-```bash
-nvidia-smi
-```
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+PIN_MEMORY = DEVICE.type == "cuda"
+torch.backends.cudnn.benchmark = DEVICE.type == "cuda"
 
-Если увидел:
 
-* `cuda:0`
-* процесс `python.exe`
-* занята память GPU
+def iter_valid_labels(folder: Path, allowed_chars):
+    allowed = set(allowed_chars)
+    for fpath in sorted(folder.glob("*.jpg")):
+        label = fpath.stem.split("_")[0].upper()
+        if len(label) != EXPECTED_LEN:
+            continue
+        if any(char not in allowed for char in label):
+            continue
+        yield fpath, label
 
-значит обучение реально идёт на видеокарте.
 
----
+def infer_chars(train_dir: Path, val_dir: Path):
+    if not AUTO_CHARS_FROM_DATA:
+        return DEFAULT_CHARS
 
-# 9. Самое главное
+    discovered = set()
+    for folder in [train_dir, val_dir]:
+        for fpath in sorted(folder.glob("*.jpg")):
+            label = fpath.stem.split("_")[0].upper()
+            if len(label) != EXPECTED_LEN:
+                continue
+            discovered.update(label)
 
-Если сейчас у тебя вывод:
+    chars = sorted(discovered, key=lambda value: DEFAULT_CHARS.index(value))
+    return chars if chars else DEFAULT_CHARS
 
-```python id="2yewj4"
-Device : cpu
-```
 
-то **CUDA сейчас не работает вообще**, и сначала нужно проверить:
+CHARS = infer_chars(TRAIN_DIR, VAL_DIR)
+BLANK_IDX = 0
+CHARS_DICT = {char: index + 1 for index, char in enumerate(CHARS)}
+IDX_TO_CHAR = {index + 1: char for index, char in enumerate(CHARS)}
+NUM_CLASSES = len(CHARS) + 1
 
-1. `torch.cuda.is_available()`
-2. `torch.version.cuda`
-3. `nvidia-smi`
 
-Потому что твой код уже умеет работать на GPU, просто среда пока нет.
+def scan_folder(folder: Path):
+    ok = 0
+    wrong_len = []
+    bad = []
 
-И да, на твоём NVIDIA GeForce RTX 4090 Laptop GPU LPRNet будет летать в разы быстрее, чем на CPU.
-На CPU это минуты на эпоху, на GPU - секунды. Люди покупают такие видеокарты не чтобы греть комнату.
+    for fpath in sorted(folder.glob("*.jpg")):
+        label = fpath.stem.split("_")[0].upper()
+        if len(label) != EXPECTED_LEN:
+            wrong_len.append((fpath.name, label, len(label)))
+            continue
+
+        bad_chars = [char for char in label if char not in CHARS_DICT]
+        if bad_chars:
+            bad.append((fpath.name, label, bad_chars))
+            continue
+
+        ok += 1
+
+    return ok, wrong_len, bad
+
+
+def motion_blur(image: np.ndarray, ksize: int) -> np.ndarray:
+    kernel = np.zeros((ksize, ksize), dtype=np.float32)
+    if random.random() < 0.5:
+        kernel[ksize // 2, :] = 1.0
+    else:
+        kernel[:, ksize // 2] = 1.0
+    kernel /= kernel.sum()
+    return cv2.filter2D(image, -1, kernel)
+
+
+def jpeg_artifacts(image: np.ndarray, quality: int) -> np.ndarray:
+    ok, encoded = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+    if not ok:
+        return image
+    decoded = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+    return decoded if decoded is not None else image
+
+
+def mild_perspective(image: np.ndarray) -> np.ndarray:
+    height, width = image.shape[:2]
+    shift_x = width * random.uniform(0.01, 0.05)
+    shift_y = height * random.uniform(0.01, 0.08)
+
+    src = np.float32([
+        [0, 0],
+        [width - 1, 0],
+        [width - 1, height - 1],
+        [0, height - 1],
+    ])
+    dst = np.float32([
+        [random.uniform(0, shift_x), random.uniform(0, shift_y)],
+        [width - 1 - random.uniform(0, shift_x), random.uniform(0, shift_y)],
+        [width - 1 - random.uniform(0, shift_x), height - 1 - random.uniform(0, shift_y)],
+        [random.uniform(0, shift_x), height - 1 - random.uniform(0, shift_y)],
+    ])
+    matrix = cv2.getPerspectiveTransform(src, dst)
+    return cv2.warpPerspective(
+        image,
+        matrix,
+        (width, height),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+
+
+def augment_image(image: np.ndarray) -> np.ndarray:
+    augmented = image.copy()
+
+    if random.random() < 0.45:
+        alpha = random.uniform(0.8, 1.2)
+        beta = random.uniform(-18, 18)
+        augmented = cv2.convertScaleAbs(augmented, alpha=alpha, beta=beta)
+
+    if random.random() < 0.20:
+        gamma = random.uniform(0.8, 1.25)
+        table = np.array([((value / 255.0) ** gamma) * 255 for value in range(256)], dtype=np.uint8)
+        augmented = cv2.LUT(augmented, table)
+
+    if random.random() < 0.18:
+        augmented = mild_perspective(augmented)
+
+    if random.random() < 0.18:
+        augmented = cv2.GaussianBlur(augmented, (3, 3), 0)
+
+    if random.random() < 0.12:
+        augmented = motion_blur(augmented, ksize=3)
+
+    if random.random() < 0.18:
+        noise = np.random.normal(0, 6, augmented.shape).astype(np.float32)
+        augmented = np.clip(augmented.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+
+    if random.random() < 0.20:
+        quality = random.randint(45, 80)
+        augmented = jpeg_artifacts(augmented, quality=quality)
+
+    return augmented
+
+
+class UZPlateDataset(Dataset):
+    def __init__(self, data_dir: Path, augment: bool):
+        self.samples = []
+        self.augment = augment
+
+        for fpath, label in iter_valid_labels(data_dir, CHARS):
+            self.samples.append((str(fpath), label))
+
+        if not self.samples:
+            raise RuntimeError(f"No valid samples found in: {data_dir}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        fpath, label = self.samples[index]
+
+        with open(fpath, "rb") as file:
+            buffer = np.frombuffer(file.read(), dtype=np.uint8)
+
+        image = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
+        if image is None:
+            raise RuntimeError(f"Failed to decode image: {fpath}")
+
+        image = cv2.resize(image, IMG_SIZE)
+
+        if self.augment:
+            image = augment_image(image)
+
+        image = image.astype(np.float32)
+        image -= 127.5
+        image *= 0.0078125
+
+        tensor = torch.from_numpy(image).permute(2, 0, 1)
+        return tensor, label, fpath
+
+
+def collate_fn(batch):
+    images, labels, paths = zip(*batch)
+    return torch.stack(images), list(labels), list(paths)
+
+
+def encode(labels):
+    targets = []
+    lengths = []
+
+    for label in labels:
+        encoded = [CHARS_DICT[char] for char in label]
+        targets.extend(encoded)
+        lengths.append(len(encoded))
+
+    return (
+        torch.tensor(targets, dtype=torch.long, device=DEVICE),
+        torch.tensor(lengths, dtype=torch.long, device=DEVICE),
+    )
+
+
+def decode(logits):
+    predictions = logits.argmax(dim=1).detach().cpu().numpy()
+    results = []
+
+    for prediction in predictions:
+        chars = []
+        prev = -1
+        for value in prediction:
+            value = int(value)
+            if value != prev and value != BLANK_IDX:
+                chars.append(IDX_TO_CHAR.get(value, ""))
+            prev = value
+        results.append("".join(chars))
+
+    return results
+
+
+def exact_match_acc(logits, labels):
+    predicted_texts = decode(logits)
+    correct = sum(pred == target for pred, target in zip(predicted_texts, labels))
+    return correct, len(labels), predicted_texts
+
+
+def char_accuracy(predicted_texts, labels):
+    correct = 0
+    total = 0
+    for prediction, target in zip(predicted_texts, labels):
+        for pred_char, target_char in zip(prediction, target):
+            if pred_char == target_char:
+                correct += 1
+        total += len(target)
+    return correct, total
+
+
+def build_position_stats(samples):
+    per_position_counts = [Counter() for _ in range(EXPECTED_LEN)]
+    per_char_counts = Counter()
+
+    for _path, label in samples:
+        for position, char in enumerate(label):
+            per_position_counts[position][char] += 1
+            per_char_counts[char] += 1
+
+    return per_position_counts, per_char_counts
+
+
+def build_balanced_sampler(dataset):
+    per_position_counts, _ = build_position_stats(dataset.samples)
+    weights = []
+
+    for _path, label in dataset.samples:
+        score = 0.0
+        for position, char in enumerate(label):
+            freq = per_position_counts[position][char]
+            score += 1.0 / math.sqrt(max(freq, 1))
+        weights.append(score / EXPECTED_LEN)
+
+    weights_tensor = torch.tensor(weights, dtype=torch.double)
+    return WeightedRandomSampler(weights_tensor, num_samples=len(weights_tensor), replacement=True)
+
+
+def position_charset_string(samples):
+    per_position_counts, per_char_counts = build_position_stats(samples)
+    position_sets = []
+    for position, counts in enumerate(per_position_counts):
+        chars = "".join(sorted(counts.keys(), key=lambda value: DEFAULT_CHARS.index(value)))
+        position_sets.append(f"{position}:{chars}")
+    present = "".join(sorted(per_char_counts.keys(), key=lambda value: DEFAULT_CHARS.index(value)))
+    return present, position_sets
+
+
+def split_trainable_params(model):
+    head_keywords = ("container", "classifier", "head", "fc")
+    backbone_params = []
+    head_params = []
+
+    for name, parameter in model.named_parameters():
+        if any(keyword in name.lower() for keyword in head_keywords):
+            head_params.append(parameter)
+        else:
+            backbone_params.append(parameter)
+
+    if not head_params:
+        return [{"params": model.parameters(), "lr": LR}]
+
+    return [
+        {"params": backbone_params, "lr": BACKBONE_LR},
+        {"params": head_params, "lr": LR},
+    ]
+
+
+def set_head_only_trainable(model):
+    head_keywords = ("container", "classifier", "head", "fc")
+    found = False
+    for name, parameter in model.named_parameters():
+        is_head = any(keyword in name.lower() for keyword in head_keywords)
+        parameter.requires_grad = is_head
+        found = found or is_head
+
+    if not found:
+        for parameter in model.parameters():
+            parameter.requires_grad = True
+
+
+def set_all_trainable(model):
+    for parameter in model.parameters():
+        parameter.requires_grad = True
+
+
+def load_pretrained(model):
+    if not USE_PRETRAINED or not PRETRAINED_PATH.exists():
+        print("Training from scratch.")
+        return
+
+    try:
+        state = torch.load(PRETRAINED_PATH, map_location=DEVICE, weights_only=True)
+    except TypeError:
+        state = torch.load(PRETRAINED_PATH, map_location=DEVICE)
+
+    if not isinstance(state, dict):
+        print("Pretrained file is not a state_dict-like object. Training from scratch.")
+        return
+
+    model_state = model.state_dict()
+    loaded = {}
+    skipped = []
+
+    for key, value in state.items():
+        if key in model_state and hasattr(value, "shape") and value.shape == model_state[key].shape:
+            loaded[key] = value
+        else:
+            skipped.append(key)
+
+    model_state.update(loaded)
+    model.load_state_dict(model_state)
+    print(f"Loaded layers : {len(loaded)}")
+    print(f"Skipped layers: {len(skipped)}")
+
+
+def build_optimizer(model):
+    if USE_PRETRAINED:
+        param_groups = split_trainable_params(model)
+        return optim.AdamW(param_groups, weight_decay=WEIGHT_DECAY)
+    return optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
+
+def should_replace_best(best_exact, best_char, val_exact, val_char):
+    if val_exact > best_exact:
+        return True
+    if val_exact == best_exact and val_char > best_char:
+        return True
+    return False
+
+
+def main():
+    print(f"Device       : {DEVICE}")
+    print(f"CUDA avail   : {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"GPU          : {torch.cuda.get_device_name(0)}")
+    print(f"Chars        : {''.join(CHARS)}")
+    print(f"Classes      : {NUM_CLASSES} (blank=0)")
+    print(f"Plate length : {EXPECTED_LEN}")
+    print(f"Use augment  : {USE_AUGMENT}")
+    print(f"Use sampler  : {USE_BALANCED_SAMPLER}")
+    print(f"Use pretrained: {USE_PRETRAINED}")
+
+    for split_name, folder in [("TRAIN", TRAIN_DIR), ("VAL", VAL_DIR)]:
+        ok, wrong_len, bad = scan_folder(folder)
+        print(f"\n=== {split_name} ===")
+        print(f"OK labels: {ok}")
+        if wrong_len:
+            print(f"Wrong length: {len(wrong_len)}")
+            for fname, label, length in wrong_len[:10]:
+                print(f"  {fname} -> '{label}' (len={length})")
+        if bad:
+            print(f"Bad chars: {len(bad)}")
+            for fname, label, chars in bad[:10]:
+                print(f"  {fname} -> '{label}' bad={chars}")
+
+    train_ds = UZPlateDataset(TRAIN_DIR, augment=USE_AUGMENT)
+    val_ds = UZPlateDataset(VAL_DIR, augment=False)
+
+    present_chars, position_sets = position_charset_string(train_ds.samples)
+    print(f"\nTrain chars  : {present_chars}")
+    print("Per-position :", " | ".join(position_sets))
+    print(f"Train samples: {len(train_ds)}")
+    print(f"Val samples  : {len(val_ds)}")
+
+    train_sampler = build_balanced_sampler(train_ds) if USE_BALANCED_SAMPLER else None
+
+    train_dl = DataLoader(
+        train_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        collate_fn=collate_fn,
+        num_workers=0,
+        pin_memory=PIN_MEMORY,
+        persistent_workers=False,
+    )
+    val_dl = DataLoader(
+        val_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=0,
+        pin_memory=PIN_MEMORY,
+        persistent_workers=False,
+    )
+
+    model = build_lprnet(
+        lpr_max_len=EXPECTED_LEN,
+        phase=False,
+        class_num=NUM_CLASSES,
+        dropout_rate=DROPOUT_RATE,
+    ).to(DEVICE)
+    print("Model device :", next(model.parameters()).device)
+
+    load_pretrained(model)
+
+    if USE_PRETRAINED and FREEZE_BACKBONE_EPOCHS > 0:
+        set_head_only_trainable(model)
+        print(f"Warmup: head-only for first {FREEZE_BACKBONE_EPOCHS} epochs")
+    else:
+        set_all_trainable(model)
+
+    ctc_loss = torch.nn.CTCLoss(blank=BLANK_IDX, reduction="mean", zero_infinity=True)
+    optimizer = build_optimizer(model)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="max",
+        factor=LR_FACTOR,
+        patience=LR_PATIENCE,
+        min_lr=MIN_LR,
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=(DEVICE.type == "cuda"))
+
+    best_exact = -1.0
+    best_char = -1.0
+    epochs_without_improvement = 0
+    shape_printed = False
+
+    for epoch in range(1, EPOCHS + 1):
+        if epoch == FREEZE_BACKBONE_EPOCHS + 1 and USE_PRETRAINED and FREEZE_BACKBONE_EPOCHS > 0:
+            set_all_trainable(model)
+            optimizer = build_optimizer(model)
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="max",
+                factor=LR_FACTOR,
+                patience=LR_PATIENCE,
+                min_lr=MIN_LR,
+            )
+            scaler = torch.amp.GradScaler("cuda", enabled=(DEVICE.type == "cuda"))
+            print("Backbone unfrozen. Fine-tuning all layers now.")
+
+        model.train()
+        train_loss = 0.0
+
+        for batch_index, (images, labels, paths) in enumerate(train_dl):
+            images = images.to(DEVICE, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.amp.autocast("cuda", enabled=(DEVICE.type == "cuda")):
+                raw_logits = model(images)
+                if not shape_printed:
+                    print(f"\nDEBUG logits shape [B,C,T]: {tuple(raw_logits.shape)}")
+                    print(f"DEBUG first labels          : {labels[:5]}")
+                    print(f"DEBUG first paths           : {paths[:3]}")
+                    shape_printed = True
+
+                logits = raw_logits.permute(2, 0, 1)
+                log_probs = torch.nn.functional.log_softmax(logits, dim=2).contiguous()
+                targets, target_lengths = encode(labels)
+                input_lengths = torch.full(
+                    (images.size(0),),
+                    logits.size(0),
+                    dtype=torch.long,
+                    device=DEVICE,
+                )
+                loss = ctc_loss(log_probs, targets, input_lengths, target_lengths)
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+
+            train_loss += loss.item()
+
+            if batch_index == 0 and epoch in {1, 2, 5, 10, 20, 40, 60, 80, 100, 120}:
+                preview = decode(raw_logits[:5])
+                print(f"\nTrain batch preview @ epoch {epoch}")
+                print("GT:", labels[:5])
+                print("PR:", preview)
+
+        model.eval()
+        exact_correct = 0
+        exact_total = 0
+        char_correct = 0
+        char_total = 0
+        sample_pred = None
+        sample_gt = None
+
+        with torch.no_grad():
+            for images, labels, _paths in val_dl:
+                images = images.to(DEVICE, non_blocking=True)
+                logits = model(images)
+                batch_correct, batch_total, pred_texts = exact_match_acc(logits, labels)
+                exact_correct += batch_correct
+                exact_total += batch_total
+
+                batch_char_correct, batch_char_total = char_accuracy(pred_texts, labels)
+                char_correct += batch_char_correct
+                char_total += batch_char_total
+
+                if sample_pred is None:
+                    sample_pred = pred_texts[:5]
+                    sample_gt = labels[:5]
+
+        avg_loss = train_loss / max(1, len(train_dl))
+        val_exact = exact_correct / max(1, exact_total)
+        val_char = char_correct / max(1, char_total)
+
+        scheduler.step(val_char)
+        lr_string = ", ".join(f"{group['lr']:.6f}" for group in optimizer.param_groups)
+        print(
+            f"Epoch {epoch:3d}/{EPOCHS} | "
+            f"loss={avg_loss:.4f} | "
+            f"exact_acc={val_exact:.3f} ({exact_correct}/{exact_total}) | "
+            f"char_acc={val_char:.3f} | "
+            f"lr=[{lr_string}]"
+        )
+
+        if sample_pred is not None and epoch in {1, 2, 5, 10, 20, 40, 60, 80, 100, 120}:
+            print("  GT :", sample_gt)
+            print("  PR :", sample_pred)
+
+        if should_replace_best(best_exact, best_char, val_exact, val_char):
+            best_exact = val_exact
+            best_char = val_char
+            epochs_without_improvement = 0
+            torch.save(model.state_dict(), SAVE_PATH)
+            print(f"Saved best model: exact={best_exact:.3f}, char={best_char:.3f}")
+        else:
+            epochs_without_improvement += 1
+
+        if epoch >= MIN_EPOCHS and epochs_without_improvement >= EARLY_STOP_PATIENCE:
+            print(
+                f"Early stopping at epoch {epoch}: "
+                f"no validation improvement for {epochs_without_improvement} epochs."
+            )
+            break
+
+    print(f"\nDone. Best exact acc: {best_exact:.3f}")
+    print(f"Best char acc: {best_char:.3f}")
+    print(f"Model saved to: {SAVE_PATH}")
+
+
+if __name__ == "__main__":
+    import torch.multiprocessing as mp
+
+    mp.freeze_support()
+    main()
